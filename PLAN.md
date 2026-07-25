@@ -3,62 +3,112 @@
 Scope: one shareable link where a client picks a service and slot, pays a deposit,
 and gets reminders. Two flows only: provider onboarding, public booking.
 
+## Stack
+
+| Layer | Choice |
+|---|---|
+| App | Next.js 16 App Router + TypeScript + Tailwind v4 |
+| Auth | **Better Auth** (magic link plugin) |
+| DB | **Postgres 17 in Docker** + Drizzle ORM |
+| Payments | **Unresolved — see "Payments" below.** Polar cannot be used. |
+| Email | Resend |
+| Deploy | **Docker Compose on your VPS**, Caddy in front for TLS |
+
 ## Decisions locked
 
 | Question | Decision |
 |---|---|
 | Slot step | Start at availability window start, step by `duration + buffer` |
-| Stripe | Connect Express, **direct charges + `application_fee_amount`** |
 | Cancellation | Tokenized cancel link; auto-refund outside window, keep deposit inside |
-| Provider auth | Supabase magic link, SMTP pointed at Resend |
+| Provider auth | Magic link, email sent through Resend |
 
-## Stack additions
+---
 
-Beyond the existing scaffold (Next 16 / React 19 / TS / Tailwind v4):
+## Payments — the swap that doesn't work
 
-- `@supabase/supabase-js` + `@supabase/ssr` — DB and auth
-- `stripe` — server SDK only, no Stripe.js needed (Checkout is a redirect)
-- `resend` + `react-email` — transactional email
-- `date-fns` + `@date-fns/tz` — timezone math
-- `vitest` — unit tests for slot generation
-- `zod` — parse form and webhook input
+**Polar.sh explicitly prohibits this product.** Its acceptable use policy limits the
+platform to digital goods and software, and names the exclusions directly: physical goods
+of any kind, "SaaS services requiring fulfillment via physical delivery or human services,"
+and "human services such as marketing, design, web development and consulting in general."
+It states that if a company's primary offering is human services, the platform "should not
+be used."
 
-## Next.js 16 notes that affect the code
+Every customer in your target list — barbers, mobile detailers, lash techs, dog groomers,
+massage therapists, tutors — sells human services fulfilled in person. That is the
+prohibited category, not an edge case.
 
-Confirmed against `node_modules/next/dist/docs`:
+There is a second, independent blocker. Polar is a Merchant of Record for **first-party**
+sales: you selling your own products. It has no marketplace primitive for onboarding
+third-party merchants who take their own payments — no Connect Express equivalent. Polar
+does use Stripe Connect Express internally, but for paying out *its own sellers*, which is
+you, not your barbers. Under Polar you would be merchant of record for every haircut
+deposit in the system, custodying funds and owning every chargeback. That is the exact
+opposite of the "I never custody funds" property you picked Stripe Connect for.
 
-- `params`, `searchParams`, `cookies()`, `headers()` are **async-only**; sync access
-  was removed in 16. Use the generated `PageProps<'/[slug]'>` / `RouteContext` helpers.
-- `middleware.ts` is now `proxy.ts`, Node runtime only, exported function named `proxy`.
-- `revalidateTag` requires a `cacheLife` profile as a second arg. Prefer `updateTag`
-  in Server Actions for read-your-writes on the dashboard.
-- Turbopack is the default for `dev` and `build`; no flags needed.
+Either issue alone rules Polar out. Together they mean building on it produces a system
+that takes money for a while and then gets the account closed.
 
-## Data model
+### What I recommend
 
-Given tables, plus the following concrete typing. All timestamps `timestamptz`, UTC.
+**Keep Stripe Connect Express.** It is the only option in reach for a solo dev on a
+two-week budget that supports third-party merchant onboarding for in-person services.
+
+If the goal was getting *off Stripe specifically*, the marketplace-capable alternatives are
+Mangopay, Adyen for Platforms, Mollie Connect, and PayPal Commerce Platform. All of them
+carry heavier onboarding than Stripe — contracts or compliance review before you can take a
+live payment — and none is a two-week drop-in. Every merchant-of-record product in Polar's
+category (Paddle, Lemon Squeezy, Dodo) has the same digital-goods-only restriction and
+fails for the same reason.
+
+**I have not written the payments section of the build below.** Tell me the rail and I'll
+fill it in; the rest of the plan is rail-independent.
+
+---
+
+## Auth — Better Auth
+
+Note that Better Auth replaces **only** Supabase Auth. Supabase was also the database, so
+that half of the swap needs its own answer: Postgres in a container, which the VPS move
+makes natural anyway.
+
+- `better-auth` with the `magicLink` plugin and the Drizzle adapter.
+- Handler at `src/app/api/auth/[...all]/route.ts` via `toNextJsHandler`.
+- Sessions read server-side with `auth.api.getSession({ headers: await headers() })` —
+  `headers()` is async in Next 16.
+- Magic link emails go through Resend directly from the plugin's `sendMagicLink`. This is
+  strictly simpler than the Supabase plan, which needed Supabase's SMTP repointed at Resend
+  to dodge its ~3/hour built-in limit. That whole problem disappears.
+- Better Auth owns `user`/`session`/`account`/`verification` tables. `providers` becomes a
+  profile table keyed by `user.id` rather than carrying its own `email` and identity.
+
+## Database
+
+Postgres 17 as a Compose service, Drizzle for schema and migrations
+(`drizzle-kit generate` / `migrate`), run on container start.
+
+Schema is unchanged from the previous plan except that `providers.id` now references
+Better Auth's `user.id`:
 
 ```
-providers          + slug unique, timezone IANA text, cancellation_window_hours int
-                     default 24, buffer_minutes int default 0
-services           + sort_order int, is_active bool
-availability_rules + weekday 0-6, start_time/end_time are `time` (wall clock in
-                     provider timezone — NOT timestamps)
-blackouts          + starts_at/ends_at timestamptz UTC
-bookings           + status: pending|confirmed|cancelled|expired|completed
-                     deposit_status: unpaid|paid|refunded|failed
-                     + cancel_token uuid, hold_expires_at, stripe_checkout_session_id
+providers          slug unique, timezone IANA, cancellation_window_hours int default 24,
+                   buffer_minutes int default 0, user_id -> user.id
+services           sort_order, is_active
+availability_rules weekday 0-6, start_time/end_time as `time` (wall clock in provider tz)
+blackouts          starts_at/ends_at timestamptz UTC
+bookings           status: pending|confirmed|cancelled|expired|completed
+                   deposit_status: unpaid|paid|refunded|failed
+                   + cancel_token uuid, hold_expires_at, provider_payment_ref
 ```
 
-Two additions I need and will call out rather than sneak in:
+Two additions I flagged before and still need: `cancel_token` for the cancel link, and
+`hold_expires_at` to stop two clients paying for the same slot.
 
-1. `bookings.cancel_token uuid` — required for the cancel link.
-2. `bookings.hold_expires_at timestamptz` — required to stop two clients paying for
-   the same slot (see below).
+**Row Level Security is dropped** — it was a Supabase-shaped answer. The app connects as a
+single owner role and is the only thing touching the database, so RLS adds nothing here.
 
 ### Double-booking guard
 
-A DB-level guard, not application logic:
+Unchanged, and still a DB constraint rather than application logic:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;
@@ -68,28 +118,16 @@ ALTER TABLE bookings ADD CONSTRAINT no_overlap EXCLUDE USING gist (
 ) WHERE (status IN ('pending','confirmed'));
 ```
 
-Flow: create booking as `pending` with `hold_expires_at = now() + 30 min` → redirect to
-Checkout → `checkout.session.completed` flips it to `confirmed`, `checkout.session.expired`
-flips it to `expired` (releasing the slot). A daily sweep catches anything the webhook missed.
-
-The constraint enforces literal overlap only. Buffer is enforced in slot generation, not
-in the constraint, so that changing `buffer_minutes` never invalidates existing rows.
-
-### RLS
-
-All DB access is server-side with the service role key. RLS on, no public policies —
-the anon key is never used for table reads. Simplest correct posture for v1.
+Buffer stays out of the constraint and lives in slot generation, so changing
+`buffer_minutes` never invalidates existing rows.
 
 ## Slot generation — the hard part
 
-Pure function, zero I/O, in `src/lib/slots.ts`:
+Unchanged and rail-independent. Pure function, zero I/O, `src/lib/slots.ts`:
 
 ```ts
 generateSlots(input: {
-  date: string              // YYYY-MM-DD in provider tz
-  timezone: string          // IANA
-  durationMinutes: number
-  bufferMinutes: number
+  date: string; timezone: string; durationMinutes: number; bufferMinutes: number
   rules: { weekday: number; startTime: string; endTime: string }[]
   bookings: { startsAt: Date; durationMinutes: number }[]
   blackouts: { startsAt: Date; endsAt: Date }[]
@@ -97,67 +135,77 @@ generateSlots(input: {
 }): Date[]                  // UTC instants
 ```
 
-Algorithm: resolve each weekday rule to a UTC interval for that local date → step by
-`duration + buffer` from the window start → keep a candidate if `[start, start+duration)`
-fits the window, doesn't overlap any booking padded by buffer on both sides, doesn't
-intersect a blackout, and starts after `now`.
+Tests: exact window fit, trailing partial slot dropped, buffer on both sides of an existing
+booking, blackout splitting a day, DST spring-forward (9-5 is 7 real hours), DST fall-back
+(9 hours), booking spanning midnight UTC but not local, past slots filtered on today,
+multiple rules per weekday, empty rules. Vitest.
 
-Unit tests cover: exact window fit, trailing partial slot dropped, buffer applied on both
-sides of an existing booking, blackout mid-window splitting the day, DST spring-forward
-(a 9-5 day that is 7 real hours), DST fall-back (9 hours), booking that spans midnight UTC
-but not local, past slots filtered on today, multiple rules on one weekday, empty rules.
+## Deployment — Docker on your VPS
 
-Everything stored UTC, rendered via `Intl.DateTimeFormat` in the provider timezone.
+```
+compose.yaml
+  app       Next standalone build, output: 'standalone' in next.config.ts
+  db        postgres:17-alpine, named volume
+  caddy     reverse proxy, automatic TLS via Let's Encrypt
+```
+
+Multi-stage Dockerfile: deps → build → runner on `node:22-alpine`, non-root user, only
+`.next/standalone`, `.next/static`, and `public` in the final image.
+
+This move fixes two real problems in the previous plan:
+
+- **Reminders can be exact.** Vercel Hobby crons fire once a day, so the plan was a daily
+  batch emailing everyone 24–48h out. With your own box it's a real crontab hitting an
+  authenticated endpoint every 15 minutes, so T-24h means T-24h.
+- **No idle pausing.** Supabase free tier suspends a project after ~7 days of inactivity,
+  which is fatal for a booking link that sits quiet for a week. A container doesn't do that.
+
+It also moves work onto you: **`pg_dump` on a cron plus offsite copy is now yours to own.**
+Nobody is backing this database up by default, and it holds money-linked records. I'll
+include a backup service in the Compose file, but restores need testing by a human.
+
+The "$0 infrastructure" constraint is now "whatever the VPS costs" — fixed and predictable
+rather than usage-scaled, which for this product is probably the better shape.
 
 ## Build order
 
-1. **Schema + migrations** — SQL in `supabase/migrations/`, typed client, seed script.
-2. **Slot generation + tests** — pure function first, green Vitest suite, no UI.
-3. **Public booking `/[slug]`** — header, service list, slot picker, client form,
-   pending booking, Checkout redirect, webhook, `/[slug]/confirmed`. Stripe test mode.
-4. **Cancel flow** — `/cancel/[token]`, window check, refund with
-   `refund_application_fee: true` so the platform fee returns with the deposit.
-5. **Provider onboarding** — magic link, Connect Express onboarding + return/refresh
-   URLs, services CRUD, weekly hours, settings, "here's your link".
+1. **Postgres + Drizzle schema + migrations**, Compose skeleton, seed script.
+2. **Slot generation + tests** — pure function first, green suite, no UI.
+3. **Public booking `/[slug]`** — header, service list, slot picker, client form, pending
+   booking with hold. *Payment step blocked on the rail decision.*
+4. **Cancel flow** — `/cancel/[token]`, window check, refund.
+5. **Provider onboarding** — magic link, payment onboarding, services CRUD, weekly hours,
+   settings, "here's your link".
 6. **Dashboard** — upcoming bookings list, settings page. No charts.
-7. **Emails** — confirmation to both parties on webhook; 24h reminder via daily cron.
+7. **Emails** — confirmation to both parties, T-24h reminder via cron.
+8. **Dockerfile + Compose + Caddy + backup job.**
 
-Small commits, `tsc --noEmit` and `eslint` green before each.
-
-## Reminders on $0
-
-Vercel Hobby crons fire **once per day**. So reminders are a single daily job at a fixed
-hour that emails everyone with an appointment 24–48h out, rather than an exact T-24h send.
-Fine for v1; it's the one place the free tier visibly shapes the product. Same job sweeps
-expired pending holds.
+Steps 1, 2, 4 (logic), 6 and 8 are unblocked today. Small commits, `tsc --noEmit` and
+`eslint` green before each.
 
 ## Env vars
 
 ```
-NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY
-STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET / STRIPE_CONNECT_CLIENT_ID
-PLATFORM_FEE_BPS          # basis points, e.g. 200 = 2%
+DATABASE_URL
+BETTER_AUTH_SECRET / BETTER_AUTH_URL
 RESEND_API_KEY / EMAIL_FROM
 NEXT_PUBLIC_APP_URL
 CRON_SECRET
+# payment rail vars TBD
 ```
 
 ## Where I'm guessing, not certain
 
-- **Platform fee size.** You chose direct charges + application fee but not an amount.
-  I've made it `PLATFORM_FEE_BPS` and will default it to `0` so nothing is silently
-  skimmed. Tell me the number and it's a one-line change.
-- **Who absorbs the fee.** With direct charges the provider is merchant of record and
-  pays Stripe's processing fee; your application fee comes out of their side too. If you
-  meant the *client* to cover it, that's a different calculation and I should know now.
-- **Supabase free tier pauses** a project after ~7 days of inactivity. Harmless while
-  you're building, fatal for a live booking link — worth knowing before you hand the URL
-  to a real barber.
-- **Express onboarding is not instant.** Some providers get `charges_enabled: false`
-  pending verification. I'll gate the public link on `charges_enabled` and show a
-  "finish Stripe setup" state, since a live link that can't take money is worse than no link.
-- **No SMS** means the reminder is email-only, and this audience's clients are texters.
-  Your call and I'm not relitigating it — just flagging that it's the likeliest v1 gap.
+- **Better Auth API shape.** I'm confident about the magic link plugin, Drizzle adapter and
+  `toNextJsHandler`, less so about exact option names. I'll verify against the installed
+  package's docs before writing code rather than trusting recall.
+- **Polar's policy could change**, and I could not fetch the policy pages directly — both
+  returned 403 to my fetcher, so the quotes above come from search result excerpts of
+  Polar's own acceptable use pages, which were consistent across two independent searches.
+  If you have a written exception from Polar, that changes the first blocker but not the
+  merchant-of-record one.
+- **Platform fee, still unanswered from last round.** Whatever rail we land on, I need to
+  know the cut and who absorbs it. Defaulting to zero so nothing is silently skimmed.
 
 ## Non-goals (not building)
 
