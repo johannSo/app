@@ -10,7 +10,7 @@ and gets reminders. Two flows only: provider onboarding, public booking.
 | App | Next.js 16 App Router + TypeScript + Tailwind v4 |
 | Auth | **Better Auth** (magic link plugin) |
 | DB | **Postgres 17 in Docker** + Drizzle ORM |
-| Payments | **Unresolved — see "Payments" below.** Polar cannot be used. |
+| Payments | **Stripe Connect Express**, direct charges + application fee |
 | Email | Resend |
 | Deploy | **Docker Compose on your VPS**, Caddy in front for TLS |
 
@@ -21,47 +21,58 @@ and gets reminders. Two flows only: provider onboarding, public booking.
 | Slot step | Start at availability window start, step by `duration + buffer` |
 | Cancellation | Tokenized cancel link; auto-refund outside window, keep deposit inside |
 | Provider auth | Magic link, email sent through Resend |
+| Payments | Stripe Connect Express, direct charges + `application_fee_amount` |
+
+> Polar was evaluated and rejected: its acceptable use policy excludes human services, and
+> it has no third-party merchant onboarding. Reasoning kept in git history at `6a9343f`.
 
 ---
 
-## Payments — the swap that doesn't work
+## Payments — Stripe Connect Express
 
-**Polar.sh explicitly prohibits this product.** Its acceptable use policy limits the
-platform to digital goods and software, and names the exclusions directly: physical goods
-of any kind, "SaaS services requiring fulfillment via physical delivery or human services,"
-and "human services such as marketing, design, web development and consulting in general."
-It states that if a company's primary offering is human services, the platform "should not
-be used."
+Direct charges on the connected account. The provider is merchant of record, pays Stripe's
+processing fee, and funds never touch a platform balance.
 
-Every customer in your target list — barbers, mobile detailers, lash techs, dog groomers,
-massage therapists, tutors — sells human services fulfilled in person. That is the
-prohibited category, not an edge case.
+**Provider onboarding.** Create an Express account, then an Account Link with `return_url`
+and `refresh_url` back into the dashboard. Account Links are single-use and short-lived, so
+the refresh path has to mint a fresh one rather than reuse the old URL.
 
-There is a second, independent blocker. Polar is a Merchant of Record for **first-party**
-sales: you selling your own products. It has no marketplace primitive for onboarding
-third-party merchants who take their own payments — no Connect Express equivalent. Polar
-does use Stripe Connect Express internally, but for paying out *its own sellers*, which is
-you, not your barbers. Under Polar you would be merchant of record for every haircut
-deposit in the system, custodying funds and owning every chargeback. That is the exact
-opposite of the "I never custody funds" property you picked Stripe Connect for.
+**Gating.** Express verification is not always instant. The public booking link stays
+disabled until `charges_enabled` is true, with a "finish Stripe setup" state in the
+dashboard — a live link that can't take money is worse than no link. Kept current via the
+`account.updated` Connect event.
 
-Either issue alone rules Polar out. Together they mean building on it produces a system
-that takes money for a while and then gets the account closed.
+**Taking the deposit.** Checkout Session created *on the connected account* (`stripeAccount`
+request option), with `payment_intent_data.application_fee_amount` for the platform cut and
+an idempotency key derived from the pending booking id. Session metadata carries the booking
+id so the webhook can resolve it without a lookup table.
 
-### What I recommend
+**Webhooks.** One endpoint at `src/app/api/stripe/webhook/route.ts`, registered as a
+**Connect** endpoint so it receives events from connected accounts (each carries an
+`account` field). Raw body via `await req.text()` for signature verification — do not parse
+JSON first. Events handled:
 
-**Keep Stripe Connect Express.** It is the only option in reach for a solo dev on a
-two-week budget that supports third-party merchant onboarding for in-person services.
+| Event | Effect |
+|---|---|
+| `checkout.session.completed` | booking → `confirmed`, deposit → `paid`, send both emails |
+| `checkout.session.expired` | booking → `expired`, releasing the slot |
+| `charge.refunded` | deposit → `refunded` |
+| `account.updated` | cache `charges_enabled` on the provider |
 
-If the goal was getting *off Stripe specifically*, the marketplace-capable alternatives are
-Mangopay, Adyen for Platforms, Mollie Connect, and PayPal Commerce Platform. All of them
-carry heavier onboarding than Stripe — contracts or compliance review before you can take a
-live payment — and none is a two-week drop-in. Every merchant-of-record product in Polar's
-category (Paddle, Lemon Squeezy, Dodo) has the same digital-goods-only restriction and
-fails for the same reason.
+Handlers are idempotent — Stripe retries, and a duplicate `completed` must not send a second
+confirmation email.
 
-**I have not written the payments section of the build below.** Tell me the rail and I'll
-fill it in; the rest of the plan is rail-independent.
+**Refunds.** On cancel outside the window, refund on the connected account with
+`refund_application_fee: true`, so the platform fee goes back with the deposit rather than
+being kept on a booking that didn't happen.
+
+**Local dev.** `stripe listen --forward-to localhost:3000/api/stripe/webhook`. Test mode
+throughout; no live keys until the flow is green end to end.
+
+**Self-hosting notes.** The webhook needs a publicly reachable HTTPS URL, which Caddy
+provides — this is one thing Vercel gave for free that now needs the reverse proxy up before
+Stripe can be wired. Account Link return URLs must be HTTPS too, so `NEXT_PUBLIC_APP_URL`
+has to be the real domain, not an IP.
 
 ---
 
@@ -172,26 +183,27 @@ rather than usage-scaled, which for this product is probably the better shape.
 1. **Postgres + Drizzle schema + migrations**, Compose skeleton, seed script.
 2. **Slot generation + tests** — pure function first, green suite, no UI.
 3. **Public booking `/[slug]`** — header, service list, slot picker, client form, pending
-   booking with hold. *Payment step blocked on the rail decision.*
-4. **Cancel flow** — `/cancel/[token]`, window check, refund.
-5. **Provider onboarding** — magic link, payment onboarding, services CRUD, weekly hours,
-   settings, "here's your link".
+   booking with hold, Checkout redirect, webhook, `/[slug]/confirmed`. Stripe test mode.
+4. **Cancel flow** — `/cancel/[token]`, window check, refund with `refund_application_fee`.
+5. **Provider onboarding** — magic link, Connect Express onboarding + `charges_enabled`
+   gating, services CRUD, weekly hours, settings, "here's your link".
 6. **Dashboard** — upcoming bookings list, settings page. No charts.
 7. **Emails** — confirmation to both parties, T-24h reminder via cron.
 8. **Dockerfile + Compose + Caddy + backup job.**
 
-Steps 1, 2, 4 (logic), 6 and 8 are unblocked today. Small commits, `tsc --noEmit` and
-`eslint` green before each.
+Nothing is blocked. Small commits, `tsc --noEmit` and `eslint` green before each.
 
 ## Env vars
 
 ```
-DATABASE_URL
+DATABASE_URL              # postgres://... pointing at the db service
+POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
 BETTER_AUTH_SECRET / BETTER_AUTH_URL
+STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET
+PLATFORM_FEE_BPS          # basis points, e.g. 200 = 2%. Defaults to 0.
 RESEND_API_KEY / EMAIL_FROM
-NEXT_PUBLIC_APP_URL
+NEXT_PUBLIC_APP_URL       # real HTTPS domain — Stripe return URLs require it
 CRON_SECRET
-# payment rail vars TBD
 ```
 
 ## Where I'm guessing, not certain
@@ -199,13 +211,17 @@ CRON_SECRET
 - **Better Auth API shape.** I'm confident about the magic link plugin, Drizzle adapter and
   `toNextJsHandler`, less so about exact option names. I'll verify against the installed
   package's docs before writing code rather than trusting recall.
-- **Polar's policy could change**, and I could not fetch the policy pages directly — both
-  returned 403 to my fetcher, so the quotes above come from search result excerpts of
-  Polar's own acceptable use pages, which were consistent across two independent searches.
-  If you have a written exception from Polar, that changes the first blocker but not the
-  merchant-of-record one.
-- **Platform fee, still unanswered from last round.** Whatever rail we land on, I need to
-  know the cut and who absorbs it. Defaulting to zero so nothing is silently skimmed.
+- **Platform fee, unanswered across two rounds now.** I need the number, and confirmation
+  of who absorbs it. With direct charges the *provider* is merchant of record and pays both
+  Stripe's processing fee and your application fee out of their side; if you meant the
+  client to cover it, the deposit amount charged has to be grossed up and that's different
+  math in the Checkout Session. Shipping with `PLATFORM_FEE_BPS=0` until you say otherwise,
+  so nothing is silently skimmed from providers.
+- **Stripe account requirements for a platform.** Taking an application fee makes you a
+  payment facilitator in Stripe's eyes and their Connect platform review can ask for company
+  details before enabling live application fees. Test mode is unaffected, so this won't slow
+  the build — but it can slow your first real payment, and it's better known now than in
+  week three.
 
 ## Non-goals (not building)
 
